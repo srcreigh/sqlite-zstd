@@ -20,6 +20,9 @@ struct ColumnInfo {
     is_dict_id: bool,
 }
 
+fn def_primary_key() -> Vec<String> {
+    vec!["rowid".to_string()]
+}
 fn def_min_dict_size() -> i64 {
     5000
 }
@@ -46,6 +49,9 @@ pub struct TransparentCompressConfig {
     pub table: String,
     /// the name of the column
     pub column: String,
+    /// for non-rowid tables, the key to update rows by
+    #[serde(default = "def_primary_key")]
+    pub primary_key: Vec<String>,
     /// The compression level. Valid levels are 1-19.
     /// Compression will be significantly slower when the level is increased, but decompression speed should stay about the same regardless of compression level.
     /// That means this is a tradeoff between zstd_incremental_maintenance vs SELECT performance.
@@ -697,6 +703,7 @@ enum MaintRet {
 
 struct EscapedNames {
     compressed_tablename: String,
+    pkey_colnames: Vec<String>,
     data_colname: String,
     dict_colname: String,
 }
@@ -704,6 +711,11 @@ impl From<&TransparentCompressConfig> for EscapedNames {
     fn from(config: &TransparentCompressConfig) -> EscapedNames {
         EscapedNames {
             compressed_tablename: escape_sqlite_identifier(&format!("_{}_zstd", config.table)),
+            pkey_colnames: config
+                .primary_key
+                .iter()
+                .map(|c| escape_sqlite_identifier(c))
+                .collect(),
             data_colname: escape_sqlite_identifier(&config.column),
             dict_colname: escape_sqlite_identifier(&format!("_{}_dict", config.column)),
         }
@@ -820,12 +832,31 @@ fn maintenance_for_todo(
     );
     loop {
         let update_start = Instant::now();
+        let (pkey_lhs, pkey_rhs) = if esc_names.pkey_colnames.len() == 1 {
+            let col = &esc_names.pkey_colnames[0];
+            (col.clone(), col.clone())
+        } else {
+            let cols = esc_names.pkey_colnames.join(", ");
+            (format!("({cols})"), cols)
+        };
+
         let q = &format!(
-            "update {tbl} set {datacol} = zstd_compress_col({datacol}, :lvl, :dict, :compact), {dictcol} = :dict where rowid in (select rowid from {tbl} where {dictcol} is null and :dictchoice = ({chooser}) limit :chunksize)",
+            "update {tbl}
+     set {datacol} = zstd_compress_col({datacol}, :lvl, :dict, :compact),
+         {dictcol} = :dict
+     where {pkey_lhs} in (
+         select {pkey_rhs}
+         from {tbl}
+         where {dictcol} is null
+           and :dictchoice = ({chooser})
+         limit :chunksize
+     )",
             tbl = esc_names.compressed_tablename,
             datacol = esc_names.data_colname,
             dictcol = esc_names.dict_colname,
-            chooser = config.dict_chooser
+            chooser = config.dict_chooser,
+            pkey_lhs = pkey_lhs,
+            pkey_rhs = pkey_rhs,
         );
         log::trace!("executing {}", q);
         let updated = db
